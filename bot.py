@@ -1,7 +1,9 @@
-# KENSUR_Master_Bot 1.3
+# KENSUR_Master_Bot 1.3 (адаптированный для Render)
+import os
 import logging
 import re
 import asyncio
+import json
 import calendar
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
@@ -21,11 +23,17 @@ from httpx import ConnectError, TimeoutException
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 # ========== НАСТРОЙКИ ==========
-BOT_VERSION = "KENSUR_Master_Bot 1.3 12.03.2026"
+BOT_VERSION = "KENSUR_Master_Bot 1.3 (Render)"
 TOKEN = "8714306378:AAEcPtbIQflVdP3gRwJSujqe2ujB7y5NZ1w"          # ← ваш токен
 ADMIN_CHAT_ID = 413964692          # ← ваш личный ID (будет добавлен в админы)
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
 SHEET_NAME = "Masters_Reports"     # название вашей таблицы
+
+# Если на Render переданы credentials как переменная окружения, создаём файл
+if "GOOGLE_CREDENTIALS" in os.environ:
+    with open(GOOGLE_SHEETS_CREDENTIALS, "w") as f:
+        f.write(os.environ["GOOGLE_CREDENTIALS"])
+    logger.info("Файл credentials.json создан из переменной окружения.")
 
 # Состояния для регистрации
 (LAST_NAME, FIRST_NAME, MIDDLE_NAME, CITY, PHONE, BANK, SBP_PHONE, FIO_SBP) = range(8)
@@ -606,7 +614,7 @@ async def edit_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Изменение отменено.", reply_markup=get_main_menu(is_admin(user_id)))
         return ConversationHandler.END
 
-# ========== ОБРАБОТКА КНОПОК МЕНЮ (исправлено: используется фильтр Text) ==========
+# ========== ОБРАБОТКА КНОПОК МЕНЮ ==========
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text = update.message.text
@@ -1296,8 +1304,7 @@ async def screenshot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     report_id = context.user_data.get('awaiting_screenshot_for')
     if not report_id:
-        # Если нет ожидающего скриншота, просто игнорируем (или можно ответить)
-        # await update.message.reply_text("Сейчас не ожидается скриншот.")
+        # Если нет ожидающего скриншота, просто игнорируем
         return
 
     if update.message.photo:
@@ -1338,7 +1345,6 @@ async def skip_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ========== ОБРАБОТКА СУММЫ ОПЛАТЫ ОТ АДМИНА ==========
 async def payment_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    # Игнорируем, если это кнопка меню (но menu_handler уже отфильтровал)
     if not is_admin(user_id):
         return
     report_id = context.user_data.get('pay_report_id')
@@ -1350,7 +1356,6 @@ async def payment_amount_handler(update: Update, context: ContextTypes.DEFAULT_T
         amount = float(update.message.text.strip())
         if amount < 0:
             raise ValueError
-        # Сохраняем сумму в user_data для последующего подтверждения
         context.user_data['payment_amount'] = amount
         keyboard = [
             [InlineKeyboardButton("✅ Да", callback_data="amount_yes"),
@@ -1389,14 +1394,12 @@ async def amount_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         success = update_report_payment_amount(report_id, str(amount))
         if success:
             await safe_edit_message(query, f"✅ Сумма {amount} руб. сохранена. Теперь вы можете отметить отчёт как оплаченный.", None)
-            # Показываем кнопку "Отметить оплаченным"
             pay_keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Отметить оплаченным", callback_data=f"pay_{report_id}")]
             ])
             await context.bot.send_message(chat_id=user_id, text="Нажмите кнопку ниже, чтобы завершить оплату:", reply_markup=pay_keyboard)
         else:
             await safe_edit_message(query, "❌ Не удалось сохранить сумму.", None)
-        # Очищаем временные данные
         del context.user_data['pay_report_id']
         del context.user_data['payment_amount']
         if 'awaiting_amount_confirm' in context.user_data:
@@ -1433,65 +1436,124 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup=get_main_menu(is_admin(user_id))
     )
 
-# ========== ЗАПУСК БОТА ==========
+# ========== ЗАПУСК БОТА (АВТООПРЕДЕЛЕНИЕ РЕЖИМА) ==========
 def main():
-    app = Application.builder().token(TOKEN).connect_timeout(10).read_timeout(15).write_timeout(15).build()
+    # Проверяем, запущены ли мы на Render (есть переменная окружения RENDER_EXTERNAL_URL)
+    if "RENDER_EXTERNAL_URL" in os.environ:
+        # Режим Render – webhook
+        port = int(os.environ.get("PORT", 8000))
+        render_url = os.environ["RENDER_EXTERNAL_URL"]
+        logger.info(f"Запуск на Render, URL: {render_url}, порт: {port}")
 
-    # Сначала диалоги (они имеют приоритет)
-    reg_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, last_name_handler)],
-            FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, first_name_handler)],
-            MIDDLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, middle_name_handler)],
-            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
-            BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_handler)],
-            SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sbp_phone_handler)],
-            FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, fio_sbp_handler)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(reg_conv)
+        # Создаём приложение без Updater (он не нужен для webhook)
+        app = Application.builder().token(TOKEN).updater(None).connect_timeout(30).read_timeout(30).write_timeout(30).build()
 
-    edit_conv = ConversationHandler(
-        entry_points=[CommandHandler("edit_profile", edit_profile), MessageHandler(filters.Text("✏️ Изменить СБП-реквизиты"), edit_profile)],
-        states={
-            EDIT_CHOICE: [CallbackQueryHandler(edit_choice_callback)],
-            EDIT_SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sbp_phone_handler)],
-            EDIT_FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_fio_sbp_handler)],
-            EDIT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_confirm_handler)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(edit_conv)
+        # Добавляем все обработчики (как обычно)
+        reg_conv = ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, last_name_handler)],
+                FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, first_name_handler)],
+                MIDDLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, middle_name_handler)],
+                CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
+                PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
+                BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_handler)],
+                SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sbp_phone_handler)],
+                FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, fio_sbp_handler)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        app.add_handler(reg_conv)
 
-    report_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("new_report", new_report),
-            MessageHandler(filters.Text("📸 Новая установка"), new_report)
-        ],
-        states={
-            ADDR_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_city_handler)],
-            ADDR_CITY_CONFIRM: [CallbackQueryHandler(addr_city_confirm_callback)],
-            ADDR_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_street_handler)],
-            ADDR_STREET_CONFIRM: [CallbackQueryHandler(addr_street_confirm_callback)],
-            ADDR_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_house_handler)],
-            ADDR_HOUSE_CONFIRM: [CallbackQueryHandler(addr_house_confirm_callback)],
-            ADDR_APARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_apartment_handler)],
-            ADDR_APARTMENT_CONFIRM: [CallbackQueryHandler(addr_apartment_confirm_callback)],
-            PHOTOS: [
-                MessageHandler(filters.PHOTO, photos_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, photos_handler)
+        edit_conv = ConversationHandler(
+            entry_points=[CommandHandler("edit_profile", edit_profile), MessageHandler(filters.Text("✏️ Изменить СБП-реквизиты"), edit_profile)],
+            states={
+                EDIT_CHOICE: [CallbackQueryHandler(edit_choice_callback)],
+                EDIT_SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sbp_phone_handler)],
+                EDIT_FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_fio_sbp_handler)],
+                EDIT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_confirm_handler)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        app.add_handler(edit_conv)
+
+        report_conv = ConversationHandler(
+            entry_points=[
+                CommandHandler("new_report", new_report),
+                MessageHandler(filters.Text("📸 Новая установка"), new_report)
             ],
-            EXTRA_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_expenses_handler)],
-            EXTRA_EXPENSES_CONFIRM: [CallbackQueryHandler(extra_expenses_confirm_callback)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(report_conv)
+            states={
+                ADDR_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_city_handler)],
+                ADDR_CITY_CONFIRM: [CallbackQueryHandler(addr_city_confirm_callback)],
+                ADDR_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_street_handler)],
+                ADDR_STREET_CONFIRM: [CallbackQueryHandler(addr_street_confirm_callback)],
+                ADDR_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_house_handler)],
+                ADDR_HOUSE_CONFIRM: [CallbackQueryHandler(addr_house_confirm_callback)],
+                ADDR_APARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_apartment_handler)],
+                ADDR_APARTMENT_CONFIRM: [CallbackQueryHandler(addr_apartment_confirm_callback)],
+                PHOTOS: [
+                    MessageHandler(filters.PHOTO, photos_handler),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, photos_handler)
+                ],
+                EXTRA_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_expenses_handler)],
+                EXTRA_EXPENSES_CONFIRM: [CallbackQueryHandler(extra_expenses_confirm_callback)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        app.add_handler(report_conv)
 
-    # Обработчики callback-запросов
+        app.add_handler(CallbackQueryHandler(amount_confirm_callback, pattern="^amount_"))
+        app.add_handler(CallbackQueryHandler(button_callback))
+
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("skip", skip_screenshot))
+
+        app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
+
+        menu_buttons = ["📸 Новая установка", "📊 Статистика", "📊 Результат мастеров", "✏️ Изменить СБП-реквизиты"]
+        app.add_handler(MessageHandler(filters.Text(menu_buttons) & ~filters.COMMAND, menu_handler))
+
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount_handler))
+
+        # Настройка вебхука и запуск веб-сервера
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        from starlette.requests import Request
+        from starlette.responses import Response, PlainTextResponse
+
+        async def telegram(request: Request) -> Response:
+            await app.update_queue.put(Update.de_json(await request.json(), app.bot))
+            return Response()
+
+        async def health(_: Request) -> PlainTextResponse:
+            return PlainTextResponse("OK")
+
+        starlette_app = Starlette(routes=[
+            Route(f"/telegram", telegram, methods=["POST"]),
+            Route("/healthcheck", health, methods=["GET"]),
+        ])
+
+        async def run():
+            webhook_url = f"{render_url}/telegram"
+            await app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+            logger.info(f"Webhook установлен на {webhook_url}")
+            async with app:
+                await app.start()
+                server = uvicorn.Server(
+                    uvicorn.Config(starlette_app, host="0.0.0.0", port=port, log_level="info")
+                )
+                await server.serve()
+                await app.stop()
+
+        asyncio.run(run())
+    else:
+        # Локальный запуск с polling
+        logger.info("Локальный запуск с polling")
+        app = Application.builder().token(TOKEN).connect_timeout(10).read_timeout(15).write_timeout(15).build()
+
+        # Добавляем все обработчики (те же, что и выше, но можно скопировать)
+         # Обработчики callback-запросов
     app.add_handler(CallbackQueryHandler(amount_confirm_callback, pattern="^amount_"))
     app.add_handler(CallbackQueryHandler(button_callback))
 
