@@ -29,6 +29,12 @@ ADMIN_CHAT_ID = 413964692          # ← ваш личный ID (будет до
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
 SHEET_NAME = "Masters_Reports"     # название вашей таблицы
 
+# Настройка логирования (должна быть до первого использования logger)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # Если на Render переданы credentials как переменная окружения, создаём файл
 if "GOOGLE_CREDENTIALS" in os.environ:
     with open(GOOGLE_SHEETS_CREDENTIALS, "w") as f:
