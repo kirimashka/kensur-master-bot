@@ -1,0 +1,6 @@
+credentials.json
+credentials.txt
+*.env
+__pycache__/
+*.pyc
+Настройки для Render.txt
