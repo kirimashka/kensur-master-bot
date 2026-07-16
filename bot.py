@@ -65,6 +65,9 @@ if "GOOGLE_CREDENTIALS" in os.environ:
 (EDITREPORT_CHOICE, EDITREPORT_ADDRESS, EDITREPORT_EXPENSES,
  EDITREPORT_PHOTOS, EDITREPORT_CONFIRM) = range(30, 35)
 
+# Состояние подтверждения выхода из создания отчёта (кнопка «🚪 Выйти» на любом шаге)
+REPORT_EXIT_CONFIRM = 35
+
 # Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -283,12 +286,16 @@ _reports_header_ensured = {"done": False}
 
 def _ensure_admin_viewed_header(reports_sheet):
     """Колонка P (admin_viewed) появилась в новой версии бота — если в существующей
-    таблице заголовка ещё нет, дописываем его один раз за время жизни процесса."""
+    таблице заголовка ещё нет, дописываем его один раз за время жизни процесса.
+    Best-effort: любая ошибка здесь не должна ломать сохранение/просмотр отчёта."""
     if _reports_header_ensured["done"]:
         return
-    if not reports_sheet.acell('P1').value:
-        reports_sheet.update_acell('P1', 'admin_viewed')
-    _reports_header_ensured["done"] = True
+    try:
+        if not reports_sheet.acell('P1').value:
+            reports_sheet.update_acell('P1', 'admin_viewed')
+        _reports_header_ensured["done"] = True
+    except Exception as e:
+        logger.warning(f"Не удалось проверить/дописать заголовок admin_viewed: {e}")
 
 @retry_on_network_error
 def save_report(user_id, photos, extra_expenses, last_name, first_name, middle_name,
@@ -1118,6 +1125,50 @@ def yes_no_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def report_confirm_keyboard(has_back=True):
+    """Клавиатура подтверждения на шагах создания отчёта: «Отмена» здесь не
+    прерывает весь отчёт, а возвращает на предыдущий шаг; для полного выхода
+    есть отдельная кнопка «Выйти» с вопросом про сохранение черновика."""
+    row2 = []
+    if has_back:
+        row2.append(InlineKeyboardButton("⬅️ Назад", callback_data="confirm_back"))
+    row2.append(InlineKeyboardButton("🚪 Выйти", callback_data="confirm_exit"))
+    keyboard = [
+        [InlineKeyboardButton("✅ Да", callback_data="confirm_yes"),
+         InlineKeyboardButton("🔄 Изменить", callback_data="confirm_no")],
+        row2
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def report_exit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Общий для всех шагов создания отчёта обработчик кнопки «🚪 Выйти»."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data == "confirm_exit":
+        keyboard = [
+            [InlineKeyboardButton("💾 Сохранить черновик", callback_data="exit_save")],
+            [InlineKeyboardButton("🗑 Удалить черновик", callback_data="exit_discard")]
+        ]
+        await safe_edit_message(
+            query,
+            "Выйти из создания отчёта? Черновик можно сохранить и продолжить позже через «📸 Новая установка».",
+            InlineKeyboardMarkup(keyboard)
+        )
+        return REPORT_EXIT_CONFIRM
+
+    if data == "exit_discard":
+        delete_draft(user_id)
+        await safe_edit_message(query, "Черновик удалён.", None)
+    else:  # exit_save
+        await safe_edit_message(query, "Черновик сохранён — продолжите позже через «📸 Новая установка».", None)
+
+    context.user_data.clear()
+    await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(user_id)))
+    return ConversationHandler.END
+
 def confirm_payment_keyboard(report_id):
     keyboard = [
         [InlineKeyboardButton("✅ Отметить оплаченным", callback_data=f"pay_{report_id}")],
@@ -1205,7 +1256,7 @@ async def addr_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     save_draft(update.effective_user.id, step=0, addr_city=context.user_data['addr_city'])
     await update.message.reply_text(
         f"Город: {context.user_data['addr_city']}\nВсё верно?",
-        reply_markup=yes_no_keyboard()
+        reply_markup=report_confirm_keyboard(has_back=False)
     )
     return ADDR_CITY_CONFIRM
 
@@ -1215,14 +1266,9 @@ async def addr_city_confirm_callback(update: Update, context: ContextTypes.DEFAU
     if query.data == "confirm_yes":
         await safe_edit_message(query, "Введите улицу:" + step_suffix(2), None)
         return ADDR_STREET
-    elif query.data == "confirm_no":
+    else:  # confirm_no — на первом шаге деваться некуда, кроме как ввести город заново
         await safe_edit_message(query, "Введите город установки заново:" + step_suffix(1), None)
         return ADDR_CITY
-    else:
-        await safe_edit_message(query, "Отмена создания отчёта.", None)
-        await context.bot.send_message(chat_id=update.effective_user.id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(update.effective_user.id)))
-        delete_draft(update.effective_user.id)
-        return ConversationHandler.END
 
 # Улица
 async def addr_street_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1230,7 +1276,7 @@ async def addr_street_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_draft(update.effective_user.id, step=1, addr_street=context.user_data['addr_street'])
     await update.message.reply_text(
         f"Улица: {context.user_data['addr_street']}\nВсё верно?",
-        reply_markup=yes_no_keyboard()
+        reply_markup=report_confirm_keyboard()
     )
     return ADDR_STREET_CONFIRM
 
@@ -1243,11 +1289,9 @@ async def addr_street_confirm_callback(update: Update, context: ContextTypes.DEF
     elif query.data == "confirm_no":
         await safe_edit_message(query, "Введите улицу заново:" + step_suffix(2), None)
         return ADDR_STREET
-    else:
-        await safe_edit_message(query, "Отмена создания отчёта.", None)
-        await context.bot.send_message(chat_id=update.effective_user.id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(update.effective_user.id)))
-        delete_draft(update.effective_user.id)
-        return ConversationHandler.END
+    else:  # confirm_back — вернуться к предыдущему шагу
+        await safe_edit_message(query, "Введите город установки заново:" + step_suffix(1), None)
+        return ADDR_CITY
 
 # Дом
 async def addr_house_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1255,7 +1299,7 @@ async def addr_house_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_draft(update.effective_user.id, step=2, addr_house=context.user_data['addr_house'])
     await update.message.reply_text(
         f"Номер дома: {context.user_data['addr_house']}\nВсё верно?",
-        reply_markup=yes_no_keyboard()
+        reply_markup=report_confirm_keyboard()
     )
     return ADDR_HOUSE_CONFIRM
 
@@ -1268,11 +1312,9 @@ async def addr_house_confirm_callback(update: Update, context: ContextTypes.DEFA
     elif query.data == "confirm_no":
         await safe_edit_message(query, "Введите номер дома заново:" + step_suffix(3), None)
         return ADDR_HOUSE
-    else:
-        await safe_edit_message(query, "Отмена создания отчёта.", None)
-        await context.bot.send_message(chat_id=update.effective_user.id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(update.effective_user.id)))
-        delete_draft(update.effective_user.id)
-        return ConversationHandler.END
+    else:  # confirm_back — вернуться к предыдущему шагу
+        await safe_edit_message(query, "Введите улицу заново:" + step_suffix(2), None)
+        return ADDR_STREET
 
 # Квартира
 async def addr_apartment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1280,7 +1322,7 @@ async def addr_apartment_handler(update: Update, context: ContextTypes.DEFAULT_T
     save_draft(update.effective_user.id, step=3, addr_apartment=context.user_data['addr_apartment'])
     await update.message.reply_text(
         f"Квартира/офис: {context.user_data['addr_apartment']}\nВсё верно?",
-        reply_markup=yes_no_keyboard()
+        reply_markup=report_confirm_keyboard()
     )
     return ADDR_APARTMENT_CONFIRM
 
@@ -1304,11 +1346,9 @@ async def addr_apartment_confirm_callback(update: Update, context: ContextTypes.
     elif query.data == "confirm_no":
         await safe_edit_message(query, "Введите номер квартиры заново:" + step_suffix(4), None)
         return ADDR_APARTMENT
-    else:
-        await safe_edit_message(query, "Отмена создания отчёта.", None)
-        await context.bot.send_message(chat_id=update.effective_user.id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(update.effective_user.id)))
-        delete_draft(update.effective_user.id)
-        return ConversationHandler.END
+    else:  # confirm_back — вернуться к предыдущему шагу
+        await safe_edit_message(query, "Введите номер дома заново:" + step_suffix(3), None)
+        return ADDR_HOUSE
 
 # ========== ОБРАБОТКА ФОТО (с поддержкой групп) ==========
 async def photos_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1428,7 +1468,7 @@ async def extra_expenses_handler(update: Update, context: ContextTypes.DEFAULT_T
         save_draft(update.effective_user.id, step=5, extra_expenses=value)
         await update.message.reply_text(
             f"Сумма доп. расходов: {value} руб.\nВсё верно?",
-            reply_markup=yes_no_keyboard()
+            reply_markup=report_confirm_keyboard()
         )
         return EXTRA_EXPENSES_CONFIRM
     except ValueError:
@@ -1445,63 +1485,71 @@ async def extra_expenses_confirm_callback(update: Update, context: ContextTypes.
         # Завершаем отчёт
         photos = context.user_data.get('photos', [])
         extra = context.user_data['extra_expenses']
-        master = get_master_data(user_id)
-        if not master:
-            await safe_edit_message(query, "Ошибка: мастер не найден.", None)
+        try:
+            master = get_master_data(user_id)
+            if not master:
+                await safe_edit_message(query, "Ошибка: мастер не найден.", None)
+                delete_draft(user_id)
+                return ConversationHandler.END
+
+            report_id = save_report(
+                user_id,
+                photos,
+                extra,
+                master['last_name'],
+                master['first_name'],
+                master['middle_name'],
+                context.user_data['addr_city'],
+                context.user_data['addr_street'],
+                context.user_data['addr_house'],
+                context.user_data['addr_apartment']
+            )
             delete_draft(user_id)
-            return ConversationHandler.END
 
-        report_id = save_report(
-            user_id,
-            photos,
-            extra,
-            master['last_name'],
-            master['first_name'],
-            master['middle_name'],
-            context.user_data['addr_city'],
-            context.user_data['addr_street'],
-            context.user_data['addr_house'],
-            context.user_data['addr_apartment']
-        )
-        delete_draft(user_id)
+            admin_text = (
+                f"📄 Отчет: {master['last_name']} {master['first_name']} {master['middle_name']}, {master['city']}\n"
+                f"📍 Адрес: {context.user_data['addr_city']}, {context.user_data['addr_street']}, д.{context.user_data['addr_house']}, кв.{context.user_data['addr_apartment']}\n\n"
+                f"📸 Фото: {len(photos)} шт.\n"
+                f"💰 Доп. расходы: {extra} руб.\n"
+                f"💳 Банк: {master['bank']}\n"
+                f"📱 СБП: {format_phone(master['sbp_phone'])}\n"
+                f"👤 Получатель: {master['fio_sbp']}\n"
+                f"🆔 Отчет: {report_id}"
+            )
+            keyboard = [[InlineKeyboardButton("👁 Посмотреть отчет", callback_data=f"view_{report_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
 
-        admin_text = (
-            f"📄 Отчет: {master['last_name']} {master['first_name']} {master['middle_name']}, {master['city']}\n"
-            f"📍 Адрес: {context.user_data['addr_city']}, {context.user_data['addr_street']}, д.{context.user_data['addr_house']}, кв.{context.user_data['addr_apartment']}\n\n"
-            f"📸 Фото: {len(photos)} шт.\n"
-            f"💰 Доп. расходы: {extra} руб.\n"
-            f"💳 Банк: {master['bank']}\n"
-            f"📱 СБП: {format_phone(master['sbp_phone'])}\n"
-            f"👤 Получатель: {master['fio_sbp']}\n"
-            f"🆔 Отчет: {report_id}"
-        )
-        keyboard = [[InlineKeyboardButton("👁 Посмотреть отчет", callback_data=f"view_{report_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+            for admin_id in get_admins():
+                try:
+                    await context.bot.send_message(chat_id=int(admin_id), text=admin_text, reply_markup=reply_markup)
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
 
-        for admin_id in get_admins():
-            try:
-                await context.bot.send_message(chat_id=int(admin_id), text=admin_text, reply_markup=reply_markup)
-            except Exception as e:
-                logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
-
-        # Отправляем финальное сообщение мастеру
-        final_text = (
-            "Команда KENSUR благодарит Тебя за высокий уровень клиентского сервиса и качественную установку.\n"
-            "Отчет отправлен и будет оплачен до конца недели."
-        )
-        await safe_edit_message(query, final_text, None)
-        await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(user_id)))
+            # Отправляем финальное сообщение мастеру
+            final_text = (
+                "Команда KENSUR благодарит Тебя за высокий уровень клиентского сервиса и качественную установку.\n"
+                "Отчет отправлен и будет оплачен до конца недели."
+            )
+            await safe_edit_message(query, final_text, None)
+            await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(user_id)))
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении отчёта для {user_id}: {e}")
+            await safe_edit_message(query, "⚠️ Не удалось сохранить отчёт. Попробуйте нажать «Да» ещё раз через минуту — черновик не потерян.", None)
+            return EXTRA_EXPENSES_CONFIRM
         return ConversationHandler.END
 
     elif data == "confirm_no":
         await safe_edit_message(query, "Введите сумму дополнительных расходов заново:", None)
         return EXTRA_EXPENSES
 
-    else:  # confirm_cancel
-        await safe_edit_message(query, "Отмена создания отчёта.", None)
-        await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(user_id)))
-        delete_draft(user_id)
-        return ConversationHandler.END
+    else:  # confirm_back — вернуться к предыдущему шагу (фото)
+        await safe_edit_message(
+            query,
+            "📸 Можете добавить ещё фото, написать 'удалить' чтобы убрать последнее, "
+            "или написать 'готово', когда закончите." + step_suffix(5),
+            None
+        )
+        return PHOTOS
 
 # ========== ОБРАБОТКА КНОПОК АДМИНИСТРАТОРА ==========
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1907,6 +1955,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup=get_main_menu(is_admin(user_id))
     )
 
+# ========== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ==========
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Без этого необработанная ошибка в любом хендлере выглядела как «зависшая»
+    кнопка: сообщение просто не приходило, а причина была видна только в логах."""
+    logger.error("Необработанная ошибка при обработке апдейта:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Произошла ошибка. Попробуйте ещё раз или напишите /cancel и начните заново."
+            )
+        except Exception:
+            pass
+
 # ========== ЗАПУСК БОТА (АВТООПРЕДЕЛЕНИЕ РЕЖИМА) ==========
 def main():
     # Проверяем, запущены ли мы на Render (есть переменная окружения RENDER_EXTERNAL_URL)
@@ -1955,19 +2017,35 @@ def main():
             ],
             states={
                 ADDR_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_city_handler)],
-                ADDR_CITY_CONFIRM: [CallbackQueryHandler(addr_city_confirm_callback)],
+                ADDR_CITY_CONFIRM: [
+                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                    CallbackQueryHandler(addr_city_confirm_callback)
+                ],
                 ADDR_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_street_handler)],
-                ADDR_STREET_CONFIRM: [CallbackQueryHandler(addr_street_confirm_callback)],
+                ADDR_STREET_CONFIRM: [
+                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                    CallbackQueryHandler(addr_street_confirm_callback)
+                ],
                 ADDR_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_house_handler)],
-                ADDR_HOUSE_CONFIRM: [CallbackQueryHandler(addr_house_confirm_callback)],
+                ADDR_HOUSE_CONFIRM: [
+                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                    CallbackQueryHandler(addr_house_confirm_callback)
+                ],
                 ADDR_APARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_apartment_handler)],
-                ADDR_APARTMENT_CONFIRM: [CallbackQueryHandler(addr_apartment_confirm_callback)],
+                ADDR_APARTMENT_CONFIRM: [
+                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                    CallbackQueryHandler(addr_apartment_confirm_callback)
+                ],
                 PHOTOS: [
                     MessageHandler(filters.PHOTO, photos_handler),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, photos_handler)
                 ],
                 EXTRA_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_expenses_handler)],
-                EXTRA_EXPENSES_CONFIRM: [CallbackQueryHandler(extra_expenses_confirm_callback)],
+                EXTRA_EXPENSES_CONFIRM: [
+                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                    CallbackQueryHandler(extra_expenses_confirm_callback)
+                ],
+                REPORT_EXIT_CONFIRM: [CallbackQueryHandler(report_exit_callback)],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
@@ -2002,6 +2080,8 @@ def main():
         app.add_handler(MessageHandler(filters.Text(menu_buttons) & ~filters.COMMAND, menu_handler))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount_handler))
+
+        app.add_error_handler(error_handler)
 
         # Автосводка 1-го числа каждого месяца в 9:00 по Москве
         app.job_queue.run_monthly(
