@@ -203,7 +203,7 @@ def get_master_stats(user_id, month=None, year=None):
         count += 1
         try:
             total += float(rec.get('payment_amount', 0))
-        except:
+        except (ValueError, TypeError):
             pass
     return count, total
 
@@ -257,7 +257,7 @@ def get_all_masters_stats(month=None, year=None):
         stats[uid]['count'] += 1
         try:
             stats[uid]['total'] += float(rec.get('payment_amount', 0))
-        except:
+        except (ValueError, TypeError):
             pass
     return stats
 
@@ -484,7 +484,7 @@ def get_draft(user_id):
     sheet = get_sheet()
     try:
         drafts_sheet = sheet.worksheet("Drafts")
-    except:
+    except gspread.WorksheetNotFound:
         return None
     try:
         cell = drafts_sheet.find(str(user_id))
@@ -501,8 +501,8 @@ def get_draft(user_id):
                 'extra_expenses': float(row[7]) if row[7] else None,
                 'updated_at': row[8]
             }
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Ошибка при чтении черновика: {e}")
     return None
 
 @retry_on_network_error
@@ -1566,6 +1566,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not report:
                 await safe_edit_message(query, "Отчет не найден.", None)
                 return
+            if not is_admin(user_id):
+                await safe_edit_message(query, "У вас нет прав для этого действия.", None)
+                return
             mark_report_viewed(report_id)
 
             master = get_master_data(report['user_id'])
@@ -1812,7 +1815,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error(f"Ошибка в button_callback: {e}")
         try:
             await query.edit_message_text("Произошла ошибка. Попробуйте позже.")
-        except:
+        except Exception:
             await context.bot.send_message(chat_id=user_id, text="Произошла ошибка. Попробуйте позже.")
 
 # ========== ОБРАБОТКА СКРИНШОТА ОТ АДМИНИСТРАТОРА ==========
@@ -1969,6 +1972,119 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             pass
 
+# ========== ОБЩИЙ НАБОР ОБРАБОТЧИКОВ (webhook и polling) ==========
+def register_handlers(app):
+    """Регистрирует все хендлеры и job_queue. Общая функция для Render (webhook) и
+    локального запуска (polling), чтобы они не могли разойтись, как раньше."""
+    reg_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, last_name_handler)],
+            FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, first_name_handler)],
+            MIDDLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, middle_name_handler)],
+            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
+            BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_handler)],
+            SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sbp_phone_handler)],
+            FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, fio_sbp_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(reg_conv)
+
+    edit_conv = ConversationHandler(
+        entry_points=[CommandHandler("edit_profile", edit_profile), MessageHandler(filters.Text("✏️ Изменить СБП-реквизиты"), edit_profile)],
+        states={
+            EDIT_CHOICE: [CallbackQueryHandler(edit_choice_callback)],
+            EDIT_SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sbp_phone_handler)],
+            EDIT_FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_fio_sbp_handler)],
+            EDIT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_confirm_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(edit_conv)
+
+    report_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("new_report", new_report),
+            MessageHandler(filters.Text("📸 Новая установка"), new_report)
+        ],
+        states={
+            ADDR_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_city_handler)],
+            ADDR_CITY_CONFIRM: [
+                CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                CallbackQueryHandler(addr_city_confirm_callback)
+            ],
+            ADDR_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_street_handler)],
+            ADDR_STREET_CONFIRM: [
+                CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                CallbackQueryHandler(addr_street_confirm_callback)
+            ],
+            ADDR_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_house_handler)],
+            ADDR_HOUSE_CONFIRM: [
+                CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                CallbackQueryHandler(addr_house_confirm_callback)
+            ],
+            ADDR_APARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_apartment_handler)],
+            ADDR_APARTMENT_CONFIRM: [
+                CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                CallbackQueryHandler(addr_apartment_confirm_callback)
+            ],
+            PHOTOS: [
+                MessageHandler(filters.PHOTO, photos_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, photos_handler)
+            ],
+            EXTRA_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_expenses_handler)],
+            EXTRA_EXPENSES_CONFIRM: [
+                CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
+                CallbackQueryHandler(extra_expenses_confirm_callback)
+            ],
+            REPORT_EXIT_CONFIRM: [CallbackQueryHandler(report_exit_callback)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(report_conv)
+
+    edit_report_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_report_start, pattern="^editreport_")],
+        states={
+            EDITREPORT_CHOICE: [CallbackQueryHandler(edit_report_choice_callback)],
+            EDITREPORT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_report_address_handler)],
+            EDITREPORT_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_report_expenses_handler)],
+            EDITREPORT_PHOTOS: [
+                MessageHandler(filters.PHOTO, edit_report_photos_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_report_photos_handler)
+            ],
+            EDITREPORT_CONFIRM: [CallbackQueryHandler(edit_report_confirm_callback)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(edit_report_conv)
+
+    app.add_handler(CallbackQueryHandler(amount_confirm_callback, pattern="^amount_"))
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("skip", skip_screenshot))
+    app.add_handler(CommandHandler("monthly_summary_now", monthly_summary_now_command))
+
+    app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
+
+    menu_buttons = ["📸 Новая установка", "📋 Мои отчёты", "📊 Статистика", "📊 Результат мастеров", "✏️ Изменить СБП-реквизиты"]
+    app.add_handler(MessageHandler(filters.Text(menu_buttons) & ~filters.COMMAND, menu_handler))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount_handler))
+
+    app.add_error_handler(error_handler)
+
+    # Автосводка 1-го числа каждого месяца в 9:00 по Москве
+    app.job_queue.run_monthly(
+        send_monthly_summaries,
+        when=dt_time(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
+        day=1
+    )
+
+
 # ========== ЗАПУСК БОТА (АВТООПРЕДЕЛЕНИЕ РЕЖИМА) ==========
 def main():
     # Проверяем, запущены ли мы на Render (есть переменная окружения RENDER_EXTERNAL_URL)
@@ -1980,115 +2096,7 @@ def main():
 
         # Создаём приложение без Updater (он не нужен для webhook)
         app = Application.builder().token(TOKEN).updater(None).connect_timeout(30).read_timeout(30).write_timeout(30).build()
-
-        # Добавляем все обработчики (как обычно)
-        reg_conv = ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, last_name_handler)],
-                FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, first_name_handler)],
-                MIDDLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, middle_name_handler)],
-                CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
-                PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
-                BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_handler)],
-                SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sbp_phone_handler)],
-                FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, fio_sbp_handler)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-        app.add_handler(reg_conv)
-
-        edit_conv = ConversationHandler(
-            entry_points=[CommandHandler("edit_profile", edit_profile), MessageHandler(filters.Text("✏️ Изменить СБП-реквизиты"), edit_profile)],
-            states={
-                EDIT_CHOICE: [CallbackQueryHandler(edit_choice_callback)],
-                EDIT_SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sbp_phone_handler)],
-                EDIT_FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_fio_sbp_handler)],
-                EDIT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_confirm_handler)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-        app.add_handler(edit_conv)
-
-        report_conv = ConversationHandler(
-            entry_points=[
-                CommandHandler("new_report", new_report),
-                MessageHandler(filters.Text("📸 Новая установка"), new_report)
-            ],
-            states={
-                ADDR_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_city_handler)],
-                ADDR_CITY_CONFIRM: [
-                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
-                    CallbackQueryHandler(addr_city_confirm_callback)
-                ],
-                ADDR_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_street_handler)],
-                ADDR_STREET_CONFIRM: [
-                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
-                    CallbackQueryHandler(addr_street_confirm_callback)
-                ],
-                ADDR_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_house_handler)],
-                ADDR_HOUSE_CONFIRM: [
-                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
-                    CallbackQueryHandler(addr_house_confirm_callback)
-                ],
-                ADDR_APARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, addr_apartment_handler)],
-                ADDR_APARTMENT_CONFIRM: [
-                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
-                    CallbackQueryHandler(addr_apartment_confirm_callback)
-                ],
-                PHOTOS: [
-                    MessageHandler(filters.PHOTO, photos_handler),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, photos_handler)
-                ],
-                EXTRA_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_expenses_handler)],
-                EXTRA_EXPENSES_CONFIRM: [
-                    CallbackQueryHandler(report_exit_callback, pattern="^confirm_exit$"),
-                    CallbackQueryHandler(extra_expenses_confirm_callback)
-                ],
-                REPORT_EXIT_CONFIRM: [CallbackQueryHandler(report_exit_callback)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-        app.add_handler(report_conv)
-
-        edit_report_conv = ConversationHandler(
-            entry_points=[CallbackQueryHandler(edit_report_start, pattern="^editreport_")],
-            states={
-                EDITREPORT_CHOICE: [CallbackQueryHandler(edit_report_choice_callback)],
-                EDITREPORT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_report_address_handler)],
-                EDITREPORT_EXPENSES: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_report_expenses_handler)],
-                EDITREPORT_PHOTOS: [
-                    MessageHandler(filters.PHOTO, edit_report_photos_handler),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, edit_report_photos_handler)
-                ],
-                EDITREPORT_CONFIRM: [CallbackQueryHandler(edit_report_confirm_callback)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-        app.add_handler(edit_report_conv)
-
-        app.add_handler(CallbackQueryHandler(amount_confirm_callback, pattern="^amount_"))
-        app.add_handler(CallbackQueryHandler(button_callback))
-
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("skip", skip_screenshot))
-        app.add_handler(CommandHandler("monthly_summary_now", monthly_summary_now_command))
-
-        app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
-
-        menu_buttons = ["📸 Новая установка", "📋 Мои отчёты", "📊 Статистика", "📊 Результат мастеров", "✏️ Изменить СБП-реквизиты"]
-        app.add_handler(MessageHandler(filters.Text(menu_buttons) & ~filters.COMMAND, menu_handler))
-
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount_handler))
-
-        app.add_error_handler(error_handler)
-
-        # Автосводка 1-го числа каждого месяца в 9:00 по Москве
-        app.job_queue.run_monthly(
-            send_monthly_summaries,
-            when=dt_time(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
-            day=1
-        )
+        register_handlers(app)
 
         # Настройка вебхука и запуск веб-сервера
         import uvicorn
@@ -2126,28 +2134,10 @@ def main():
         # Локальный запуск с polling
         logger.info("Локальный запуск с polling")
         app = Application.builder().token(TOKEN).connect_timeout(10).read_timeout(15).write_timeout(15).build()
+        register_handlers(app)
 
-        # Добавляем все обработчики (те же, что и выше, но можно скопировать)
-         # Обработчики callback-запросов
-    app.add_handler(CallbackQueryHandler(amount_confirm_callback, pattern="^amount_"))
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    # Команды
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("skip", skip_screenshot))
-
-    # Обработчик фото (должен быть до menu_handler)
-    app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
-
-    # Обработчик главного меню (теперь только для текстов, совпадающих с кнопками)
-    menu_buttons = ["📸 Новая установка", "📋 Мои отчёты", "📊 Статистика", "📊 Результат мастеров", "✏️ Изменить СБП-реквизиты"]
-    app.add_handler(MessageHandler(filters.Text(menu_buttons) & ~filters.COMMAND, menu_handler))
-
-    # Обработчик ввода суммы (получает все остальные тексты)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount_handler))
-
-    logger.info(f"{BOT_VERSION} запущен...")
-    app.run_polling()
+        logger.info(f"{BOT_VERSION} запущен...")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
