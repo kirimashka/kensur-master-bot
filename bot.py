@@ -48,6 +48,20 @@ if "GOOGLE_CREDENTIALS" in os.environ:
 # Состояния для регистрации
 (LAST_NAME, FIRST_NAME, MIDDLE_NAME, CITY, PHONE, BANK, SBP_PHONE, FIO_SBP) = range(8)
 
+# Порядок шагов и тексты приглашений регистрации — общие для прямого хода и
+# кнопки «⬅️ Назад» (см. reg_nav_keyboard/reg_nav_callback).
+REG_STEP_ORDER = [LAST_NAME, FIRST_NAME, MIDDLE_NAME, CITY, PHONE, BANK, SBP_PHONE, FIO_SBP]
+REG_STEP_PROMPTS = {
+    LAST_NAME: "Введите вашу фамилию:",
+    FIRST_NAME: "Введите ваше имя:",
+    MIDDLE_NAME: "Введите ваше отчество (если нет, введите '-'):",
+    CITY: "Введите ваш город:",
+    PHONE: "Введите ваш номер телефона для связи (например, +79991234567 или 89991234567):",
+    BANK: "Введите название вашего банка (для перевода по СБП):",
+    SBP_PHONE: "Введите номер телефона для перевода по СБП (в любом формате):",
+    FIO_SBP: "Введите ФИО получателя по СБП (как в банке):",
+}
+
 # Состояния для изменения профиля
 (EDIT_CHOICE, EDIT_SBP_PHONE, EDIT_FIO_SBP, EDIT_CONFIRM) = range(8, 12)
 
@@ -671,8 +685,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await show_main_menu(update, context)
             return ConversationHandler.END
         await update.message.reply_text(
-            "Добро пожаловать! Давайте зарегистрируемся.\n"
-            "Введите вашу фамилию:"
+            "Добро пожаловать! Давайте зарегистрируемся.\n" + REG_STEP_PROMPTS[LAST_NAME],
+            reply_markup=reg_nav_keyboard(LAST_NAME)
         )
         return LAST_NAME
     except Exception as e:
@@ -682,41 +696,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def last_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['last_name'] = update.message.text.strip()
-    await update.message.reply_text("Введите ваше имя:")
+    await update.message.reply_text(REG_STEP_PROMPTS[FIRST_NAME], reply_markup=reg_nav_keyboard(FIRST_NAME))
     return FIRST_NAME
 
 async def first_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['first_name'] = update.message.text.strip()
-    await update.message.reply_text("Введите ваше отчество (если нет, введите '-'):")
+    await update.message.reply_text(REG_STEP_PROMPTS[MIDDLE_NAME], reply_markup=reg_nav_keyboard(MIDDLE_NAME))
     return MIDDLE_NAME
 
 async def middle_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['middle_name'] = update.message.text.strip()
-    await update.message.reply_text("Введите ваш город:")
+    await update.message.reply_text(REG_STEP_PROMPTS[CITY], reply_markup=reg_nav_keyboard(CITY))
     return CITY
 
 async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['city'] = update.message.text.strip()
-    await update.message.reply_text("Введите ваш номер телефона для связи (например, +79991234567 или 89991234567):")
+    await update.message.reply_text(REG_STEP_PROMPTS[PHONE], reply_markup=reg_nav_keyboard(PHONE))
     return PHONE
 
 async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = update.message.text.strip()
     if not is_valid_phone(phone):
-        await update.message.reply_text("Некорректный формат. Введите номер в формате +7XXXXXXXXXX или 8XXXXXXXXXX:")
+        await update.message.reply_text(
+            "Некорректный формат. Введите номер в формате +7XXXXXXXXXX или 8XXXXXXXXXX:",
+            reply_markup=reg_nav_keyboard(PHONE)
+        )
         return PHONE
     context.user_data['phone'] = phone
-    await update.message.reply_text("Введите название вашего банка (для перевода по СБП):")
+    await update.message.reply_text(REG_STEP_PROMPTS[BANK], reply_markup=reg_nav_keyboard(BANK))
     return BANK
 
 async def bank_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['bank'] = update.message.text.strip()
-    await update.message.reply_text("Введите номер телефона для перевода по СБП (в любом формате):")
+    await update.message.reply_text(REG_STEP_PROMPTS[SBP_PHONE], reply_markup=reg_nav_keyboard(SBP_PHONE))
     return SBP_PHONE
 
 async def sbp_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['sbp_phone'] = update.message.text.strip()
-    await update.message.reply_text("Введите ФИО получателя по СБП (как в банке):")
+    await update.message.reply_text(REG_STEP_PROMPTS[FIO_SBP], reply_markup=reg_nav_keyboard(FIO_SBP))
     return FIO_SBP
 
 async def fio_sbp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1272,6 +1289,33 @@ async def stats_admin_month_callback(update: Update, context: ContextTypes.DEFAU
     year = int(parts[0])
     month = int(parts[1])
     await show_all_masters_stats(update, context, month, year)
+
+# ========== НАВИГАЦИЯ ПО ШАГАМ РЕГИСТРАЦИИ («Назад»/«Отменить») ==========
+def reg_nav_keyboard(state):
+    """Кнопки под приглашением каждого шага регистрации: «Назад» на предыдущий
+    шаг (кроме первого) и отмена всей регистрации — раньше опечатка на любом
+    из 8 полей заставляла начинать заново через /cancel."""
+    idx = REG_STEP_ORDER.index(state)
+    row = []
+    if idx > 0:
+        prev_state = REG_STEP_ORDER[idx - 1]
+        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"reg_back_{prev_state}"))
+    row.append(InlineKeyboardButton("🚪 Отменить регистрацию", callback_data="reg_cancel"))
+    return InlineKeyboardMarkup([row])
+
+async def reg_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Общий обработчик кнопок reg_nav_keyboard для всех шагов регистрации."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "reg_cancel":
+        context.user_data.clear()
+        await safe_edit_message(query, "Регистрация отменена. Введите /start, чтобы начать заново.", None)
+        return ConversationHandler.END
+
+    prev_state = int(query.data.replace("reg_back_", ""))
+    await safe_edit_message(query, REG_STEP_PROMPTS[prev_state], reg_nav_keyboard(prev_state))
+    return prev_state
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КНОПОК ПОДТВЕРЖДЕНИЯ ==========
 def yes_no_keyboard():
@@ -2155,14 +2199,14 @@ def register_handlers(app):
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, last_name_handler)],
-            FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, first_name_handler)],
-            MIDDLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, middle_name_handler)],
-            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
-            BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_handler)],
-            SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sbp_phone_handler)],
-            FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, fio_sbp_handler)],
+            LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, last_name_handler), CallbackQueryHandler(reg_nav_callback)],
+            FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, first_name_handler), CallbackQueryHandler(reg_nav_callback)],
+            MIDDLE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, middle_name_handler), CallbackQueryHandler(reg_nav_callback)],
+            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler), CallbackQueryHandler(reg_nav_callback)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler), CallbackQueryHandler(reg_nav_callback)],
+            BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, bank_handler), CallbackQueryHandler(reg_nav_callback)],
+            SBP_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sbp_phone_handler), CallbackQueryHandler(reg_nav_callback)],
+            FIO_SBP: [MessageHandler(filters.TEXT & ~filters.COMMAND, fio_sbp_handler), CallbackQueryHandler(reg_nav_callback)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
