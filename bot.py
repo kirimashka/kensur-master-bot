@@ -6,7 +6,7 @@ import asyncio
 import json
 import calendar
 import time
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 from telegram.ext import (
@@ -21,6 +21,7 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx
 from httpx import ConnectError, TimeoutException
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
@@ -84,7 +85,7 @@ def retry_on_network_error(func):
     )(func)
 
 # ========== РАБОТА С GOOGLE SHEETS ==========
-_spreadsheet_cache = {"spreadsheet": None}
+_spreadsheet_cache = {"spreadsheet": None, "client": None}
 
 def get_sheet():
     """Открывает таблицу один раз за время жизни процесса и переиспользует объект —
@@ -94,8 +95,15 @@ def get_sheet():
         creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS, scopes=scope)
         client = gspread.authorize(creds)
         client.http_client.session.timeout = (30, 60)
+        _spreadsheet_cache["client"] = client
         _spreadsheet_cache["spreadsheet"] = client.open_by_key(SHEET_ID)
     return _spreadsheet_cache["spreadsheet"]
+
+def get_gspread_client():
+    """Тот же авторизованный Client, что и в get_sheet() — gspread.Spreadsheet не
+    хранит ссылку на создавший его Client, поэтому кэшируем оба объекта вместе."""
+    get_sheet()  # гарантирует, что _spreadsheet_cache["client"] уже создан
+    return _spreadsheet_cache["client"]
 
 # ---------- Работа с мастерами ----------
 CACHE_TTL_SECONDS = 600  # 10 минут
@@ -161,44 +169,67 @@ def update_master_sbp(user_id, sbp_phone, fio_sbp):
         return True
     return False
 
-# ---------- Статистика мастера ----------
+# ---------- Кэш листа Reports для статистики (короткий TTL; денежные операции пишут напрямую) ----------
+REPORTS_CACHE_TTL_SECONDS = 90
+_reports_cache = {"records": None, "ts": 0}
+
+def _invalidate_reports_cache():
+    _reports_cache["records"] = None
+
 @retry_on_network_error
-def get_master_stats(user_id, month=None, year=None):
-    """
-    Возвращает количество оплаченных установок и сумму выплат (payment_amount) для мастера.
-    Если month и year заданы, фильтрует по указанному месяцу (по полю submitted_at).
-    Если заданы только год и месяц, то берётся весь месяц.
-    Если не заданы – берётся текущий месяц с начала месяца по сегодня.
-    """
-    sheet = get_sheet()
-    reports_sheet = sheet.worksheet("Reports")
-    records = reports_sheet.get_all_records()
-    count = 0
-    total = 0.0
+def _get_reports_records():
+    """Весь лист Reports одним запросом, с коротким TTL-кэшем (90с) — экраны статистики
+    и рейтинга читаются часто при просмотре несколькими мастерами подряд, а любая
+    денежная операция (оплата/подтверждение/отмена/правка) сразу сбрасывает этот кэш
+    через _invalidate_reports_cache(), так что они никогда не видят устаревшие деньги —
+    кэш разгружает только повторные просмотры статистики."""
+    now = time.time()
+    if _reports_cache["records"] is None or now - _reports_cache["ts"] >= REPORTS_CACHE_TTL_SECONDS:
+        sheet = get_sheet()
+        reports_sheet = sheet.worksheet("Reports")
+        _reports_cache["records"] = reports_sheet.get_all_records()
+        _reports_cache["ts"] = now
+    return _reports_cache["records"]
+
+def _period_bounds(month=None, year=None):
+    """(start_date, end_date) для месяца/года; без аргументов — текущий месяц по сегодня."""
     now = datetime.now()
     if month is None or year is None:
-        # По умолчанию текущий месяц с начала месяца по сегодня
-        target_month = now.month
-        target_year = now.year
+        target_month, target_year = now.month, now.year
         start_date = datetime(target_year, target_month, 1)
         end_date = now
     else:
-        target_month = month
-        target_year = year
-        start_date = datetime(target_year, target_month, 1)
-        # последний день месяца
-        last_day = calendar.monthrange(target_year, target_month)[1]
-        end_date = datetime(target_year, target_month, last_day, 23, 59, 59)
+        start_date = datetime(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end_date = datetime(year, month, last_day, 23, 59, 59)
+    return start_date, end_date
 
+def _paid_reports_in_period(records, start_date, end_date):
+    """Оплаченные отчёты с submitted_at внутри [start_date, end_date] — общая фильтрация,
+    раньше дословно дублировалась в get_master_stats и get_all_masters_stats."""
+    result = []
     for rec in records:
-        if str(rec.get('user_id')) != str(user_id) or rec.get('payment_status') != 'оплачено':
+        if rec.get('payment_status') != 'оплачено':
             continue
         try:
             rec_date = datetime.strptime(rec.get('submitted_at'), "%Y-%m-%d %H:%M:%S")
-            if rec_date < start_date or rec_date > end_date:
-                continue
         except Exception as e:
-            logger.warning(f"Ошибка парсинга даты в get_master_stats: {e}")
+            logger.warning(f"Ошибка парсинга даты в _paid_reports_in_period: {e}")
+            continue
+        if start_date <= rec_date <= end_date:
+            result.append(rec)
+    return result
+
+# ---------- Статистика мастера ----------
+def get_master_stats(user_id, month=None, year=None):
+    """Количество оплаченных установок и сумма выплат за период (по умолчанию —
+    текущий месяц с начала месяца по сегодня)."""
+    records = _get_reports_records()
+    start_date, end_date = _period_bounds(month, year)
+    count = 0
+    total = 0.0
+    for rec in _paid_reports_in_period(records, start_date, end_date):
+        if str(rec.get('user_id')) != str(user_id):
             continue
         count += 1
         try:
@@ -207,50 +238,44 @@ def get_master_stats(user_id, month=None, year=None):
             pass
     return count, total
 
-# ---------- Статистика по всем мастерам (для администратора) ----------
-@retry_on_network_error
+def get_master_lifetime_count(user_id):
+    """Сколько всего оплаченных установок у мастера за всё время (не за месяц) —
+    для бейджей за количество установок."""
+    records = _get_reports_records()
+    return sum(
+        1 for rec in records
+        if rec.get('payment_status') == 'оплачено' and str(rec.get('user_id')) == str(user_id)
+    )
+
+# ---------- Бейджи за количество установок (не требуют новых колонок в таблице) ----------
+BADGE_LEVELS = [(10, "🥉"), (50, "🥈"), (100, "🥇"), (500, "💎")]
+
+def _badge_progress(lifetime_count):
+    """(эмодзи текущего достигнутого бейджа или None, порог следующего или None,
+    эмодзи следующего или None). Если все уровни достигнуты — (эмодзи, None, None)."""
+    current_emoji = None
+    for threshold, emoji in BADGE_LEVELS:
+        if lifetime_count >= threshold:
+            current_emoji = emoji
+        else:
+            return current_emoji, threshold, emoji
+    return current_emoji, None, None
+
+# ---------- Статистика по всем мастерам (для администратора и рейтинга) ----------
 def get_all_masters_stats(month=None, year=None):
-    """
-    Возвращает словарь: {user_id: (fio, count, total)} для всех мастеров, у которых есть оплаченные установки.
-    Если month и year заданы, фильтрует по указанному месяцу.
-    Если не заданы – текущий месяц.
-    """
-    sheet = get_sheet()
-    reports_sheet = sheet.worksheet("Reports")
-    masters_sheet = sheet.worksheet("Masters")
-    records = reports_sheet.get_all_records()
-    masters_records = masters_sheet.get_all_records()
-    # Словарь для быстрого получения ФИО по user_id
+    """{user_id: {'count', 'total', 'fio'}} для всех мастеров с ≥1 оплаченной
+    установкой за период (по умолчанию — текущий месяц)."""
+    reports_records = _get_reports_records()
+    masters_records = _get_masters_records()
     fio_dict = {}
     for m in masters_records:
         uid = str(m.get('user_id'))
         fio = f"{m.get('last_name', '')} {m.get('first_name', '')} {m.get('middle_name', '')}".strip()
         fio_dict[uid] = fio if fio else "Неизвестный"
 
-    now = datetime.now()
-    if month is None or year is None:
-        target_month = now.month
-        target_year = now.year
-        start_date = datetime(target_year, target_month, 1)
-        end_date = now
-    else:
-        target_month = month
-        target_year = year
-        start_date = datetime(target_year, target_month, 1)
-        last_day = calendar.monthrange(target_year, target_month)[1]
-        end_date = datetime(target_year, target_month, last_day, 23, 59, 59)
-
+    start_date, end_date = _period_bounds(month, year)
     stats = {}
-    for rec in records:
-        if rec.get('payment_status') != 'оплачено':
-            continue
-        try:
-            rec_date = datetime.strptime(rec.get('submitted_at'), "%Y-%m-%d %H:%M:%S")
-            if rec_date < start_date or rec_date > end_date:
-                continue
-        except Exception as e:
-            logger.warning(f"Ошибка парсинга даты в get_all_masters_stats: {e}")
-            continue
+    for rec in _paid_reports_in_period(reports_records, start_date, end_date):
         uid = str(rec.get('user_id'))
         if uid not in stats:
             stats[uid] = {'count': 0, 'total': 0.0, 'fio': fio_dict.get(uid, 'Неизвестный')}
@@ -262,12 +287,9 @@ def get_all_masters_stats(month=None, year=None):
     return stats
 
 # ---------- Получение списка месяцев, в которых есть отчёты ----------
-@retry_on_network_error
 def get_months_with_reports():
-    """Возвращает список кортежей (год, месяц) для месяцев, в которых есть хотя бы один оплаченный отчёт."""
-    sheet = get_sheet()
-    reports_sheet = sheet.worksheet("Reports")
-    records = reports_sheet.get_all_records()
+    """Список кортежей (год, месяц), где есть хотя бы один оплаченный отчёт."""
+    records = _get_reports_records()
     months_set = set()
     for rec in records:
         if rec.get('payment_status') != 'оплачено':
@@ -278,7 +300,6 @@ def get_months_with_reports():
         except Exception as e:
             logger.warning(f"Ошибка парсинга даты в get_months_with_reports: {e}")
             continue
-    # Сортируем по убыванию (сначала новые)
     return sorted(months_set, reverse=True)
 
 # ---------- Работа с отчетами ----------
@@ -323,6 +344,7 @@ def save_report(user_id, photos, extra_expenses, last_name, first_name, middle_n
         "не подтверждено",
         ""  # admin_viewed
     ])
+    _invalidate_reports_cache()
     return report_id
 
 @retry_on_network_error
@@ -334,6 +356,7 @@ def update_report_payment_amount(report_id, amount):
     if cell:
         row = cell.row
         reports_sheet.update_cell(row, 5, amount)  # payment_amount
+        _invalidate_reports_cache()
         return True
     return False
 
@@ -344,6 +367,7 @@ def mark_report_paid(report_id):
     cell = reports_sheet.find(report_id)
     if cell:
         reports_sheet.update_cell(cell.row, 7, "оплачено") # payment_status
+        _invalidate_reports_cache()
         return True
     return False
 
@@ -354,6 +378,7 @@ def mark_master_confirmed(report_id):
     cell = reports_sheet.find(report_id)
     if cell:
         reports_sheet.update_cell(cell.row, 15, "подтверждено") # master_confirmed
+        _invalidate_reports_cache()
         return True
     return False
 
@@ -367,6 +392,7 @@ def mark_report_viewed(report_id):
     cell = reports_sheet.find(report_id)
     if cell:
         reports_sheet.update_cell(cell.row, 16, "просмотрено") # admin_viewed
+        _invalidate_reports_cache()
         return True
     return False
 
@@ -393,6 +419,7 @@ def update_report_fields(report_id, photos=None, extra_expenses=None,
         reports_sheet.update(f'K{row}:N{row}', [[
             _keep(addr_city, 10), _keep(addr_street, 11), _keep(addr_house, 12), _keep(addr_apartment, 13)
         ]])
+    _invalidate_reports_cache()
     return True
 
 @retry_on_network_error
@@ -402,6 +429,7 @@ def delete_report_row(report_id):
     cell = reports_sheet.find(report_id)
     if cell:
         reports_sheet.delete_rows(cell.row)
+        _invalidate_reports_cache()
         return True
     return False
 
@@ -567,6 +595,46 @@ def format_phone(phone):
         return cleaned
     else:
         return phone
+
+# ========== ПРОВЕРКА АДРЕСА ЧЕРЕЗ DADATA (бесплатный тариф, опционально) ==========
+DADATA_API_KEY = os.environ.get("DADATA_API_KEY")
+
+async def suggest_address(city, street, house):
+    """Один запрос к бесплатному DaData Suggestions API (10 000/день, только
+    Authorization: Token — без секретного ключа; это отдельный от платного
+    Standardization/Clean API продукт) на весь адрес разом — не на каждую букву,
+    живой автокомплит в текстовом боте не нужен. Подсвечивает опечатки перед
+    сохранением отчёта. Никогда не блокирует поток: без ключа, при сбое сети или
+    недостаточной точности (qc_geo != 0, т.е. дом не найден с точными координатами)
+    тихо возвращает None, экран выглядит как раньше."""
+    if not DADATA_API_KEY:
+        return None
+    raw = f"{city}, {street}, {house}".strip(", ")
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as http_client:
+            resp = await http_client.post(
+                "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address",
+                json={"query": raw, "count": 1},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Token {DADATA_API_KEY}",
+                },
+            )
+        resp.raise_for_status()
+        suggestions = resp.json().get("suggestions") or []
+    except Exception as e:
+        logger.warning(f"DaData недоступна, оставляем адрес как введено мастером: {e}")
+        return None
+
+    if not suggestions:
+        return None
+    top = suggestions[0]
+    if str(top.get("data", {}).get("qc_geo")) != "0":
+        return None
+    value = top.get("value")
+    if not value or value.strip().lower() == raw.strip().lower():
+        return None
+    return value
 
 # ========== ГЛАВНОЕ МЕНЮ ДЛЯ МАСТЕРА ==========
 def get_main_menu(is_admin_user=False):
@@ -1014,25 +1082,37 @@ def _previous_month_year():
     return now.month - 1, now.year
 
 async def send_monthly_summaries(context: ContextTypes.DEFAULT_TYPE):
-    """Шлёт каждому мастеру личную сводку за прошлый месяц + дайджест админам.
-    Вызывается автоматически 1-го числа (JobQueue) и вручную командой /monthly_summary_now."""
+    """Шлёт каждому мастеру личную сводку за прошлый месяц (с местом в рейтинге и
+    объявлением мастера месяца) + дайджест админам. Вызывается автоматически
+    1-го числа (JobQueue) и вручную командой /monthly_summary_now."""
     month, year = _previous_month_year()
     month_name = calendar.month_name[month]
+
+    all_stats = get_all_masters_stats(month, year)
+    ranking = sorted(all_stats.items(), key=lambda kv: (-kv[1]['count'], -kv[1]['total']))
+    total_masters = len(ranking)
+    leader_uid = ranking[0][0] if ranking else None
 
     masters = _get_masters_records()
     sent, failed = 0, 0
     for m in masters:
-        uid = m.get('user_id')
+        uid = str(m.get('user_id') or '')
         if not uid:
             continue
         try:
-            count, total = get_master_stats(uid, month=month, year=year)
+            data = all_stats.get(uid, {'count': 0, 'total': 0.0})
+            count, total = data['count'], data['total']
             fio = f"{m.get('last_name', '')} {m.get('first_name', '')} {m.get('middle_name', '')}".strip()
             text = (
                 f"📊 Итоги за {month_name} {year} для {fio}:\n"
                 f"Оплаченных установок: {count}\n"
                 f"Общая сумма выплат: {total:.2f} руб."
             )
+            if uid in all_stats and total_masters > 1:
+                rank = next(i + 1 for i, (u, _) in enumerate(ranking) if u == uid)
+                text += f"\n🏆 Место в рейтинге месяца: {rank} из {total_masters}"
+            if uid == leader_uid and count > 0:
+                text += "\n\n🎉 Поздравляем — ты мастер месяца! Больше всех оплаченных установок среди мастеров."
             await context.bot.send_message(chat_id=int(uid), text=text)
             sent += 1
         except Exception as e:
@@ -1040,10 +1120,12 @@ async def send_monthly_summaries(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Не удалось отправить месячную сводку мастеру {uid}: {e}")
 
     try:
-        stats = get_all_masters_stats(month, year)
-        if stats:
+        if all_stats:
             lines = [f"📊 Дайджест за {month_name} {year} (автосводка):"]
-            for uid, data in stats.items():
+            if leader_uid:
+                leader = all_stats[leader_uid]
+                lines.append(f"🏆 Мастер месяца: {leader['fio']} ({leader['count']} уст.)")
+            for uid, data in ranking:
                 lines.append(f"{data['fio']}: {data['count']} уст., {data['total']:.2f} руб.")
             admin_text = "\n".join(lines)
         else:
@@ -1057,6 +1139,48 @@ async def send_monthly_summaries(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка формирования дайджеста для админов: {e}")
 
     logger.info(f"Месячная автосводка за {month_name} {year}: отправлено {sent}, ошибок {failed}")
+
+BACKUP_TITLE_PREFIX = f"{SHEET_NAME} — backup "
+BACKUP_RETENTION_DAYS = 14
+
+async def backup_spreadsheet(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневная копия всей таблицы в Google Drive сервис-аккаунта — единственная
+    защита денежных данных (Reports/Masters) от случайного удаления строки/листа.
+    Хранит последние BACKUP_RETENTION_DAYS дней, более старые копии удаляет.
+    Вызывается автоматически (JobQueue, run_daily) и вручную командой /backup_now."""
+    try:
+        client = get_gspread_client()
+        today = datetime.now().strftime("%Y-%m-%d")
+        title = f"{BACKUP_TITLE_PREFIX}{today}"
+        client.copy(SHEET_ID, title=title, copy_permissions=False)
+        logger.info(f"Бэкап таблицы создан: {title}")
+
+        cutoff = datetime.now() - timedelta(days=BACKUP_RETENTION_DAYS)
+        removed = 0
+        for f in client.list_spreadsheet_files():
+            name = f.get('name', '')
+            if not name.startswith(BACKUP_TITLE_PREFIX):
+                continue
+            try:
+                file_date = datetime.strptime(name[len(BACKUP_TITLE_PREFIX):], "%Y-%m-%d")
+            except ValueError:
+                continue
+            if file_date < cutoff:
+                client.del_spreadsheet(f['id'])
+                removed += 1
+        if removed:
+            logger.info(f"Удалено старых бэкапов таблицы: {removed}")
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа таблицы: {e}")
+
+async def backup_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+    await update.message.reply_text("Делаю резервную копию таблицы...")
+    await backup_spreadsheet(context)
+    await update.message.reply_text("Готово.")
 
 async def monthly_summary_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -1086,6 +1210,39 @@ async def stats_master_month_callback(update: Update, context: ContextTypes.DEFA
             f"Количество оплаченных установок: {count}\n"
             f"Общая сумма выплат: {total:.2f} руб."
         )
+
+        # Место в рейтинге месяца среди всех мастеров с оплаченными установками
+        all_stats = get_all_masters_stats(month=month, year=year)
+        uid_str = str(user_id)
+        if uid_str in all_stats and len(all_stats) > 1:
+            ranking = sorted(all_stats.items(), key=lambda kv: (-kv[1]['count'], -kv[1]['total']))
+            rank = next(i + 1 for i, (uid, _) in enumerate(ranking) if uid == uid_str)
+            msg += f"\n🏆 Место в рейтинге месяца: {rank} из {len(ranking)}"
+            if rank > 1:
+                gap = ranking[rank - 2][1]['count'] - count
+                if gap > 0:
+                    msg += f" (до {rank - 1} места не хватает установок: {gap})"
+
+        # Бейджи за общее количество установок за всё время
+        lifetime_count = get_master_lifetime_count(user_id)
+        current_emoji, next_threshold, next_emoji = _badge_progress(lifetime_count)
+        badge_line = f"\n\n🏅 Всего установок за всё время: {lifetime_count}"
+        if current_emoji:
+            badge_line += f" ({current_emoji})"
+        if next_threshold:
+            badge_line += f"\nЕщё {next_threshold - lifetime_count} — и будет {next_emoji} за {next_threshold} установок"
+        msg += badge_line
+
+        # Стаж — используем поле reg_date, которое пишется при регистрации, но раньше нигде не читалось
+        reg_date_str = master.get('reg_date') if master else None
+        if reg_date_str:
+            try:
+                reg_date = datetime.strptime(reg_date_str, "%Y-%m-%d %H:%M:%S")
+                tenure_months = (now.year - reg_date.year) * 12 + (now.month - reg_date.month)
+                if tenure_months >= 1:
+                    msg += f"\n🕒 Вместе с KENSUR уже {tenure_months} мес."
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Ошибка в stats_master_month_callback: {e}")
         msg = "Ошибка при загрузке статистики."
@@ -1297,10 +1454,21 @@ async def addr_street_confirm_callback(update: Update, context: ContextTypes.DEF
 async def addr_house_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['addr_house'] = update.message.text.strip()
     save_draft(update.effective_user.id, step=2, addr_house=context.user_data['addr_house'])
-    await update.message.reply_text(
-        f"Номер дома: {context.user_data['addr_house']}\nВсё верно?",
-        reply_markup=report_confirm_keyboard()
+
+    text = f"Номер дома: {context.user_data['addr_house']}\nВсё верно?"
+    suggestion = await suggest_address(
+        context.user_data.get('addr_city', ''),
+        context.user_data.get('addr_street', ''),
+        context.user_data['addr_house']
     )
+    if suggestion:
+        text = (
+            f"Номер дома: {context.user_data['addr_house']}\n\n"
+            f"💡 Проверка адреса: похоже, корректнее — «{suggestion}». Если у вас "
+            f"по-другому — ничего менять не нужно, просто подтвердите как есть.\n\n"
+            f"Всё верно?"
+        )
+    await update.message.reply_text(text, reply_markup=report_confirm_keyboard())
     return ADDR_HOUSE_CONFIRM
 
 async def addr_house_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1779,14 +1947,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             success = mark_master_confirmed(report_id)
             if success:
+                lifetime_count = get_master_lifetime_count(user_id)
+                current_emoji, next_threshold, next_emoji = _badge_progress(lifetime_count)
+                confirm_text = f"✅ Спасибо! Подтверждение получено.\n\n🎉 Это твоя {lifetime_count}-я оплаченная установка!"
+                if lifetime_count in dict(BADGE_LEVELS) and current_emoji:
+                    confirm_text += f" Новый бейдж: {current_emoji} за {lifetime_count} установок!"
+                elif next_threshold:
+                    confirm_text += f" Ещё {next_threshold - lifetime_count} — и получишь {next_emoji} за {next_threshold} установок."
                 try:
                     await query.edit_message_text(
-                        text="✅ Спасибо! Подтверждение получено.",
+                        text=confirm_text,
                         reply_markup=None
                     )
                 except Exception as e:
                     logger.warning(f"Не удалось отредактировать сообщение: {e}")
-                    await context.bot.send_message(chat_id=user_id, text="✅ Спасибо! Подтверждение получено.", reply_markup=get_main_menu(is_admin(user_id)))
+                    await context.bot.send_message(chat_id=user_id, text=confirm_text, reply_markup=get_main_menu(is_admin(user_id)))
                 else:
                     await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=get_main_menu(is_admin(user_id)))
 
@@ -1954,6 +2129,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/skip - пропустить отправку скриншота\n"
         "/cancel - отменить текущее действие\n"
         "/monthly_summary_now - прогнать месячную сводку сейчас (только для админов)\n"
+        "/backup_now - сделать резервную копию таблицы сейчас (только для админов)\n"
         "/help - это сообщение",
         reply_markup=get_main_menu(is_admin(user_id))
     )
@@ -2067,6 +2243,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("skip", skip_screenshot))
     app.add_handler(CommandHandler("monthly_summary_now", monthly_summary_now_command))
+    app.add_handler(CommandHandler("backup_now", backup_now_command))
 
     app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
 
@@ -2082,6 +2259,12 @@ def register_handlers(app):
         send_monthly_summaries,
         when=dt_time(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
         day=1
+    )
+
+    # Ежедневный бэкап таблицы в 4:00 по Москве (тихие часы, минимум конкуренции за API)
+    app.job_queue.run_daily(
+        backup_spreadsheet,
+        time=dt_time(hour=4, minute=0, tzinfo=ZoneInfo("Europe/Moscow"))
     )
 
 
