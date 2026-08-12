@@ -6,7 +6,9 @@ import asyncio
 import json
 import calendar
 import time
-from datetime import datetime, time as dt_time, timedelta
+import io
+import csv
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 from telegram.ext import (
@@ -105,7 +107,7 @@ def retry_on_network_error(func):
     )(func)
 
 # ========== РАБОТА С GOOGLE SHEETS ==========
-_spreadsheet_cache = {"spreadsheet": None, "client": None}
+_spreadsheet_cache = {"spreadsheet": None}
 
 def get_sheet():
     """Открывает таблицу один раз за время жизни процесса и переиспользует объект —
@@ -115,15 +117,8 @@ def get_sheet():
         creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS, scopes=scope)
         client = gspread.authorize(creds)
         client.http_client.session.timeout = (30, 60)
-        _spreadsheet_cache["client"] = client
         _spreadsheet_cache["spreadsheet"] = client.open_by_key(SHEET_ID)
     return _spreadsheet_cache["spreadsheet"]
-
-def get_gspread_client():
-    """Тот же авторизованный Client, что и в get_sheet() — gspread.Spreadsheet не
-    хранит ссылку на создавший его Client, поэтому кэшируем оба объекта вместе."""
-    get_sheet()  # гарантирует, что _spreadsheet_cache["client"] уже создан
-    return _spreadsheet_cache["client"]
 
 # ---------- Работа с мастерами ----------
 CACHE_TTL_SECONDS = 600  # 10 минут
@@ -1163,38 +1158,56 @@ async def send_monthly_summaries(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Месячная автосводка за {month_name} {year}: отправлено {sent}, ошибок {failed}")
 
-BACKUP_TITLE_PREFIX = f"{SHEET_NAME} — backup "
-BACKUP_RETENTION_DAYS = 14
+BACKUP_SHEETS = ["Masters", "Reports", "Admins"]
 
-async def backup_spreadsheet(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневная копия всей таблицы в Google Drive сервис-аккаунта — единственная
-    защита денежных данных (Reports/Masters) от случайного удаления строки/листа.
-    Хранит последние BACKUP_RETENTION_DAYS дней, более старые копии удаляет.
-    Вызывается автоматически (JobQueue, run_daily) и вручную командой /backup_now."""
-    try:
-        client = get_gspread_client()
-        today = datetime.now().strftime("%Y-%m-%d")
-        title = f"{BACKUP_TITLE_PREFIX}{today}"
-        client.copy(SHEET_ID, title=title, copy_permissions=False)
-        logger.info(f"Бэкап таблицы создан: {title}")
+async def backup_spreadsheet(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Ежедневный бэкап Masters/Reports/Admins — выгружает каждый лист в CSV и
+    присылает документами всем админам в Telegram. Возвращает True/False —
+    удалось ли отправить хотя бы один файл хотя бы одному админу.
 
-        cutoff = datetime.now() - timedelta(days=BACKUP_RETENTION_DAYS)
-        removed = 0
-        for f in client.list_spreadsheet_files():
-            name = f.get('name', '')
-            if not name.startswith(BACKUP_TITLE_PREFIX):
-                continue
+    Раньше (до 12.08.2026) пытались копировать саму таблицу в Google Drive
+    сервис-аккаунта (client.copy()) — это гарантированно падает с
+    storageQuotaExceeded: у сервис-аккаунтов нет собственной квоты хранилища
+    на обычном (не Workspace) Google-аккаунте. Ни разу не сработало за три
+    недели, но backup_now_command всё равно отвечал «Готово», потому что
+    ошибка тонула здесь же в try/except. CSV через Telegram квоты Drive не
+    требует вообще — только чтение уже существующей таблицы."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    admin_ids = get_admins()
+    if not admin_ids:
+        logger.error("Бэкап: список админов пуст, некому отправлять.")
+        return False
+
+    sheet = get_sheet()
+    any_sent = False
+    for sheet_name in BACKUP_SHEETS:
+        try:
+            ws = sheet.worksheet(sheet_name)
+            rows = ws.get_all_values()
+        except gspread.WorksheetNotFound:
+            continue
+        except Exception as e:
+            logger.error(f"Бэкап: не удалось прочитать лист {sheet_name}: {e}")
+            continue
+
+        buf = io.StringIO()
+        csv.writer(buf).writerows(rows)
+        data = buf.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel сразу открыл кириллицу
+
+        for admin_id in admin_ids:
             try:
-                file_date = datetime.strptime(name[len(BACKUP_TITLE_PREFIX):], "%Y-%m-%d")
-            except ValueError:
-                continue
-            if file_date < cutoff:
-                client.del_spreadsheet(f['id'])
-                removed += 1
-        if removed:
-            logger.info(f"Удалено старых бэкапов таблицы: {removed}")
-    except Exception as e:
-        logger.error(f"Ошибка создания бэкапа таблицы: {e}")
+                await context.bot.send_document(
+                    chat_id=int(admin_id),
+                    document=data,
+                    filename=f"{sheet_name}_{today}.csv",
+                    caption=f"📦 Бэкап листа «{sheet_name}» за {today}"
+                )
+                any_sent = True
+            except Exception as e:
+                logger.error(f"Бэкап: не удалось отправить {sheet_name} админу {admin_id}: {e}")
+
+    logger.info(f"Бэкап за {today}: {'отправлен' if any_sent else 'НЕ отправлен ни одному админу'}.")
+    return any_sent
 
 async def backup_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -1202,8 +1215,8 @@ async def backup_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Эта команда доступна только администраторам.")
         return
     await update.message.reply_text("Делаю резервную копию таблицы...")
-    await backup_spreadsheet(context)
-    await update.message.reply_text("Готово.")
+    ok = await backup_spreadsheet(context)
+    await update.message.reply_text("Готово." if ok else "⚠️ Не получилось — подробности в логах Render.")
 
 async def monthly_summary_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
