@@ -27,7 +27,10 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 
 # ========== НАСТРОЙКИ ==========
 BOT_VERSION = "KENSUR_Master_Bot 1.3 (Render)"
-TOKEN = "8714306378:AAEcPtbIQflVdP3gRwJSujqe2ujB7y5NZ1w"          # ← ваш токен
+# Токен — ТОЛЬКО из переменной окружения TELEGRAM_BOT_TOKEN (Render → Environment).
+# Раньше был зашит прямо здесь, что и привело к утечке через публичный GitHub-репозиторий
+# 12.08.2026 (кто-то перехватил вебхук через утёкший токен) — больше так не делаем.
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = 413964692          # ← ваш личный ID (будет добавлен в админы)
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
 SHEET_NAME = "Masters_Reports"     # название вашей таблицы
@@ -38,6 +41,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+if not TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN не задан в переменных окружения — бот не сможет подключиться к Telegram.")
 
 # Если на Render переданы credentials как переменная окружения, создаём файл
 if "GOOGLE_CREDENTIALS" in os.environ:
