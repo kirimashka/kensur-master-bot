@@ -2266,6 +2266,33 @@ async def sklad_outbox_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning(f"sklad outbox: {e}")
 
 
+async def sklad_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневно скачивает копию базы KENSUR Склад с сервера и шлёт файлом админам."""
+    if not SKLAD_OUTBOX_SECRET:
+        return
+    url = SKLAD_URL.rstrip("/") + "/api/outbox/backup"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.get(url, headers={"X-Outbox-Secret": SKLAD_OUTBOX_SECRET})
+            if r.status_code != 200:
+                logger.warning(f"sklad backup: HTTP {r.status_code}")
+                return
+            data = r.content
+        name = f"KENSUR_Sklad_{datetime.now(ZoneInfo('Europe/Moscow')).strftime('%Y-%m-%d')}.db"
+        for admin_id in get_admins():
+            try:
+                await context.bot.send_document(
+                    chat_id=int(admin_id),
+                    document=io.BytesIO(data),
+                    filename=name,
+                    caption=f"🏬 Копия базы KENSUR Склад за {name[13:23]} ({len(data)//1024} КБ). Открывается любым просмотрщиком SQLite; для восстановления — положить на сервер вместо prod.db.",
+                )
+            except Exception as e:
+                logger.warning(f"sklad backup: не отправлено {admin_id}: {e}")
+    except Exception as e:
+        logger.warning(f"sklad backup: {e}")
+
+
 def register_handlers(app):
     """Регистрирует все хендлеры и job_queue. Общая функция для Render (webhook) и
     локального запуска (polling), чтобы они не могли разойтись, как раньше."""
@@ -2381,6 +2408,8 @@ def register_handlers(app):
 
     # Очередь уведомлений KENSUR Склад — каждые 20 секунд
     app.job_queue.run_repeating(sklad_outbox_job, interval=20, first=10)
+    # Копия базы склада — ежедневно в 4:10 по Москве (вслед за бэкапом таблицы)
+    app.job_queue.run_daily(sklad_backup_job, time=dt_time(hour=4, minute=10, tzinfo=ZoneInfo("Europe/Moscow")))
 
     # Ежедневный бэкап таблицы в 4:00 по Москве (тихие часы, минимум конкуренции за API)
     app.job_queue.run_daily(
