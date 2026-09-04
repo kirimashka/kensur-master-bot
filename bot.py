@@ -2255,7 +2255,15 @@ async def sklad_outbox_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             sent, failed = [], []
             for it in items:
                 try:
-                    await context.bot.send_message(chat_id=int(it["tgId"]), text=it["text"])
+                    if it.get("doc"):
+                        # Документ (PDF наклеек и т.п.) — скачиваем с сервера склада и шлём файлом
+                        f = await client.get(api + "/file/" + it["doc"], headers=headers)
+                        f.raise_for_status()
+                        await context.bot.send_document(
+                            chat_id=int(it["tgId"]), document=io.BytesIO(f.content), filename=it["doc"], caption=it["text"][:1000]
+                        )
+                    else:
+                        await context.bot.send_message(chat_id=int(it["tgId"]), text=it["text"])
                     sent.append(it["id"])
                 except Exception as e:  # заблокировал бота, нет чата и т.п.
                     failed.append({"id": it["id"], "error": str(e)[:200]})
