@@ -2361,6 +2361,49 @@ async def sklad_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning(f"sklad backup: {e}")
 
 
+async def weekly_health_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в неделю: всё ли стабильно у бота и у KENSUR Склад. Сводка админам."""
+    lines = ["🩺 Еженедельная проверка KENSUR"]
+    # 1. Настройки бота в Telegram (после взлома 12.08 — самое важное)
+    try:
+        info = await context.bot.get_webhook_info()
+        ok_hook = bool(info.url) and "onrender.com" in info.url
+        lines.append(f"{'✅' if ok_hook else '❌'} Вебхук: {info.url or 'не задан'}" + (f", ошибок: {info.last_error_message}" if info.last_error_message else ""))
+        cmds = await context.bot.get_my_commands()
+        bad = [c for c in cmds if any(w in c.description.lower() for w in ("casino", "казино", "@"))]
+        lines.append(f"{'❌' if bad or not cmds else '✅'} Команды бота: {len(cmds)} шт" + (f", подозрительные: {[c.description for c in bad]}" if bad else ""))
+        me = await context.bot.get_me()
+        name = await context.bot.get_my_name()
+        lines.append(f"{'✅' if 'KENSUR' in (name.name or '') else '❌'} Имя бота: {name.name} (@{me.username})")
+    except Exception as e:
+        lines.append(f"❌ Настройки бота: не удалось проверить ({e})")
+    # 2. Сервер склада
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(SKLAD_URL.rstrip("/") + "/api/health")
+            lines.append(f"{'✅' if r.status_code == 200 else '❌'} Сервер склада: HTTP {r.status_code}")
+            if SKLAD_OUTBOX_SECRET:
+                q = await client.get(SKLAD_URL.rstrip("/") + "/api/outbox", headers={"X-Outbox-Secret": SKLAD_OUTBOX_SECRET})
+                pending = len(q.json()) if q.status_code == 200 else "?"
+                lines.append(f"{'✅' if pending == 0 else '⚠️'} Очередь уведомлений: {pending} неотправленных")
+                b = await client.get(SKLAD_URL.rstrip("/") + "/api/outbox/backup", headers={"X-Outbox-Secret": SKLAD_OUTBOX_SECRET})
+                lines.append(f"{'✅' if b.status_code == 200 else '❌'} Копия базы: {'снимается, ' + str(len(b.content) // 1024) + ' КБ' if b.status_code == 200 else 'HTTP ' + str(b.status_code)}")
+    except Exception as e:
+        lines.append(f"❌ Сервер склада недоступен: {e}")
+    # 3. Таблица бота
+    try:
+        get_sheet().worksheet("Masters")
+        lines.append("✅ Google-таблица бота доступна")
+    except Exception as e:
+        lines.append(f"❌ Google-таблица: {e}")
+    text = "\n".join(lines)
+    for admin_id in get_admins():
+        try:
+            await context.bot.send_message(chat_id=int(admin_id), text=text)
+        except Exception as e:
+            logger.warning(f"weekly_health: не отправлено {admin_id}: {e}")
+
+
 def register_handlers(app):
     """Регистрирует все хендлеры и job_queue. Общая функция для Render (webhook) и
     локального запуска (polling), чтобы они не могли разойтись, как раньше."""
@@ -2457,6 +2500,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("monthly_summary_now", monthly_summary_now_command))
     app.add_handler(CommandHandler("backup_now", backup_now_command))
     app.add_handler(CommandHandler("sklad", sklad_command))
+    app.add_handler(CommandHandler("health_now", lambda u, c: weekly_health_job(c) if is_admin(u.effective_user.id) else None))
 
     app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
 
@@ -2476,6 +2520,8 @@ def register_handlers(app):
 
     # Очередь уведомлений KENSUR Склад — каждые 20 секунд
     app.job_queue.run_repeating(sklad_outbox_job, interval=20, first=10)
+    # Еженедельная проверка стабильности — понедельник 09:00 МСК
+    app.job_queue.run_daily(weekly_health_job, time=dt_time(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")), days=(0,))
     # Копия базы склада — ежедневно в 4:10 по Москве (вслед за бэкапом таблицы)
     app.job_queue.run_daily(sklad_backup_job, time=dt_time(hour=4, minute=10, tzinfo=ZoneInfo("Europe/Moscow")))
 
