@@ -10,7 +10,7 @@ import io
 import csv
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, WebAppInfo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -37,6 +37,18 @@ ADMIN_CHAT_ID = 413964692          # ← ваш личный ID (будет до
 GOOGLE_SHEETS_CREDENTIALS = "credentials.json"
 SHEET_NAME = "Masters_Reports"     # название вашей таблицы
 SHEET_ID = "1rwB81gYU-NeLQix9mj89Q7jxL8TxMnArSrSalA2B8hU"  # ID таблицы Masters_Reports (открытие по ID быстрее, чем поиск по имени)
+
+# ===== KENSUR Склад (мини-приложение на нашем сервере в РФ) =====
+# Адрес мини-приложения: открывается кнопкой из бота прямо в Telegram.
+SKLAD_URL = os.environ.get("SKLAD_URL", "https://138.16.226.184/sklad/")
+# Сервер склада не видит Telegram, поэтому уведомления мастерам он складывает в
+# очередь, а этот бот раз в 20 секунд забирает их и отправляет. Секрет очереди
+# выводится из токена бота (тот же расчёт на сервере склада) — никаких новых
+# переменных окружения на Render не нужно, и в коде секрета нет.
+import hashlib as _hashlib
+SKLAD_OUTBOX_SECRET = os.environ.get("SKLAD_OUTBOX_SECRET") or (
+    _hashlib.sha256((TOKEN or "").encode() + b":kensur-sklad-outbox").hexdigest() if TOKEN else ""
+)
 
 # Настройка логирования (должна быть до первого использования logger)
 logging.basicConfig(
@@ -656,6 +668,7 @@ def get_main_menu(is_admin_user=False):
     if is_admin_user:
         keyboard = [
             [KeyboardButton("📸 Новая установка")],
+            [KeyboardButton("🏬 KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))],
             [KeyboardButton("📋 Мои отчёты")],
             [KeyboardButton("📊 Статистика")],
             [KeyboardButton("📊 Результат мастеров")],
@@ -664,6 +677,7 @@ def get_main_menu(is_admin_user=False):
     else:
         keyboard = [
             [KeyboardButton("📸 Новая установка")],
+            [KeyboardButton("🏬 KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))],
             [KeyboardButton("📋 Мои отчёты")],
             [KeyboardButton("📊 Статистика")],
             [KeyboardButton("✏️ Изменить СБП-реквизиты")]
@@ -2212,6 +2226,46 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 # ========== ОБЩИЙ НАБОР ОБРАБОТЧИКОВ (webhook и polling) ==========
+# ========== KENSUR СКЛАД: КНОПКА И ОЧЕРЕДЬ УВЕДОМЛЕНИЙ ==========
+async def sklad_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sklad — открыть мини-приложение «KENSUR Склад» (учёт комплектов на руках)."""
+    keyboard = [[InlineKeyboardButton("🏬 Открыть KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))]]
+    await update.message.reply_text(
+        "KENSUR Склад — комплекты и комплектующие, которые у вас на руках.\n"
+        "Отмечайте «Поставил», «Продал», принимайте выдачи одной кнопкой.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def sklad_outbox_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Забирает уведомления из очереди сервера склада и рассылает их в Telegram."""
+    if not SKLAD_OUTBOX_SECRET:
+        return
+    api = SKLAD_URL.rstrip("/") + "/api/outbox"
+    headers = {"X-Outbox-Secret": SKLAD_OUTBOX_SECRET}
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=True) as client:
+            r = await client.get(api, headers=headers)
+            if r.status_code != 200:
+                logger.warning(f"sklad outbox: HTTP {r.status_code}")
+                return
+            items = r.json()
+            if not items:
+                return
+            sent, failed = [], []
+            for it in items:
+                try:
+                    await context.bot.send_message(chat_id=int(it["tgId"]), text=it["text"])
+                    sent.append(it["id"])
+                except Exception as e:  # заблокировал бота, нет чата и т.п.
+                    failed.append({"id": it["id"], "error": str(e)[:200]})
+            await client.post(api + "/ack", headers=headers, json={"sent": sent, "failed": failed})
+            if sent or failed:
+                logger.info(f"sklad outbox: sent={len(sent)} failed={len(failed)}")
+    except Exception as e:
+        logger.warning(f"sklad outbox: {e}")
+
+
 def register_handlers(app):
     """Регистрирует все хендлеры и job_queue. Общая функция для Render (webhook) и
     локального запуска (polling), чтобы они не могли разойтись, как раньше."""
@@ -2307,6 +2361,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("skip", skip_screenshot))
     app.add_handler(CommandHandler("monthly_summary_now", monthly_summary_now_command))
     app.add_handler(CommandHandler("backup_now", backup_now_command))
+    app.add_handler(CommandHandler("sklad", sklad_command))
 
     app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
 
@@ -2323,6 +2378,9 @@ def register_handlers(app):
         when=dt_time(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
         day=1
     )
+
+    # Очередь уведомлений KENSUR Склад — каждые 20 секунд
+    app.job_queue.run_repeating(sklad_outbox_job, interval=20, first=10)
 
     # Ежедневный бэкап таблицы в 4:00 по Москве (тихие часы, минимум конкуренции за API)
     app.job_queue.run_daily(
