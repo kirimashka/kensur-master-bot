@@ -668,7 +668,7 @@ def get_main_menu(is_admin_user=False):
     if is_admin_user:
         keyboard = [
             [KeyboardButton("📸 Новая установка")],
-            [KeyboardButton("🏬 KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))],
+            [KeyboardButton("🏬 KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL)), KeyboardButton("📖 Инструкция по складу")],
             [KeyboardButton("📋 Мои отчёты")],
             [KeyboardButton("📊 Статистика")],
             [KeyboardButton("📊 Результат мастеров")],
@@ -677,7 +677,7 @@ def get_main_menu(is_admin_user=False):
     else:
         keyboard = [
             [KeyboardButton("📸 Новая установка")],
-            [KeyboardButton("🏬 KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))],
+            [KeyboardButton("🏬 KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL)), KeyboardButton("📖 Инструкция по складу")],
             [KeyboardButton("📋 Мои отчёты")],
             [KeyboardButton("📊 Статистика")],
             [KeyboardButton("✏️ Изменить СБП-реквизиты")]
@@ -698,6 +698,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         if master_exists(user_id):
             await show_main_menu(update, context)
+            # Кто ещё не зарегистрирован в KENSUR Склад — видит инструкцию сразу
+            if await sklad_registered(user_id) is False:
+                await send_sklad_instruction(update, context)
             return ConversationHandler.END
         await update.message.reply_text(
             "Добро пожаловать! Давайте зарегистрируемся.\n" + REG_STEP_PROMPTS[LAST_NAME],
@@ -770,6 +773,7 @@ async def fio_sbp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Регистрация завершена!",
             reply_markup=get_main_menu(is_admin(user_id))
         )
+        await send_sklad_instruction(update, context)
     except Exception as e:
         logger.error(f"Ошибка сохранения мастера: {e}")
         await update.message.reply_text("Ошибка при сохранении. Попробуйте позже.")
@@ -1040,6 +1044,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await edit_profile(update, context)
     elif text == "📋 Мои отчёты":
         await my_reports_handler(update, context)
+    elif text == "📖 Инструкция по складу":
+        await send_sklad_instruction(update, context)
 
 # ========== ИСТОРИЯ ОТЧЁТОВ МАСТЕРА ==========
 async def my_reports_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2227,14 +2233,68 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ========== ОБЩИЙ НАБОР ОБРАБОТЧИКОВ (webhook и polling) ==========
 # ========== KENSUR СКЛАД: КНОПКА И ОЧЕРЕДЬ УВЕДОМЛЕНИЙ ==========
+SKLAD_INSTRUCTION = [
+    "📖 KENSUR Склад — как пользоваться\n\n"
+    "Это приложение внутри этого бота. В нём видно, какие комплекты и комплектующие KENSUR у вас на руках, "
+    "и одной кнопкой отмечается, что вы поставили, продали или вернули. Устанавливать ничего не нужно.\n\n"
+    "1️⃣ Как зайти\n"
+    "• Нажмите кнопку «🏬 KENSUR Склад» в меню бота.\n"
+    "• В первый раз заполните фамилию, имя, телефон, выберите город и нажмите «Зарегистрироваться».\n"
+    "• Дождитесь подтверждения — придёт сообщение сюда. После этого откроется ваш склад.\n\n"
+    "2️⃣ Занести то, что уже лежит у вас\n"
+    "• Получите от Кирилла файл с номерами для вашего города.\n"
+    "• Напишите номер маркером на каждой коробке комплекта (сбоку и на крышке). Какая коробка получит какой номер — неважно, главное, чтобы модель совпадала.\n"
+    "• Сфотографируйте коробки так, чтобы номера читались.\n"
+    "• В приложении: «Ещё» → «Получил товар». Выберите свой город. Приложение покажет, что числится за городом: нажмите на номера комплектов, которые у вас есть, поправьте количество комплектующих, добавьте фото, нажмите «Отправить заявку».\n"
+    "• После подтверждения товар появится во вкладке «Склад», а сюда придёт акт приёма-передачи — ваш документ о том, что у вас на руках.\n"
+    "• Если на коробке уже есть наклейка с QR от склада, номер писать не нужно: в приложении нажмите «Сканировать QR».",
+
+    "3️⃣ Каждый день: три кнопки\n"
+    "🔧 Поставил — выберите комплект по номеру с коробки или отсканируйте QR, отметьте, что ещё ушло на объект (ключи, корпус, подложка), укажите адрес, добавьте фото до/после. Отправили — всё списалось само.\n"
+    "💰 Продал — если клиент купил комплект у вас. Укажите цену и как оплатил клиент: по QR компании, наличными вам или переводом вам. Если деньги у вас, закупочную стоимость переводите Кириллу, как договорились.\n"
+    "📥 Выдачи — когда вам отправили товар со склада, здесь появится карточка. Проверьте состав и нажмите «Принял всё». Если что-то не сходится — «Не сходится» и напишите, что именно.\n\n"
+    "4️⃣ Реже («Ещё»)\n"
+    "• Вернул на склад — спишется после подтверждения склада.\n"
+    "• Передал коллеге — другому мастеру вашего города, он подтвердит у себя.\n"
+    "• Утеря или брак — списать с объяснением.\n"
+    "• История — все движения по вашему складу.\n\n"
+    "5️⃣ Сроки\n"
+    "У цилиндровых механизмов срок реализации 90 дней, он показан рядом с позицией; за две недели придёт напоминание. Умные замки хранятся без срока.\n\n"
+    "6️⃣ Если что-то не так\n"
+    "• Не открывается — закройте и откройте кнопку ещё раз, проверьте интернет.\n"
+    "• Нет нужного комплекта при «Поставил» — сначала оформите «Получил товар».\n"
+    "• Ошиблись в отчёте — напишите Кириллу, он поправит.\n\n"
+    "Инструкцию всегда можно открыть кнопкой «📖 Инструкция по складу» в меню.",
+]
+
+
+async def send_sklad_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Инструкция по KENSUR Склад двумя сообщениями + кнопка открыть приложение."""
+    for i, part in enumerate(SKLAD_INSTRUCTION):
+        last = i == len(SKLAD_INSTRUCTION) - 1
+        await update.effective_message.reply_text(
+            part,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏬 Открыть KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))]]) if last else None,
+        )
+
+
+async def sklad_registered(tg_id: int) -> bool | None:
+    """Зарегистрирован ли человек в KENSUR Склад (None — сервер недоступен)."""
+    if not SKLAD_OUTBOX_SECRET:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            r = await client.get(SKLAD_URL.rstrip("/") + f"/api/outbox/user/{tg_id}", headers={"X-Outbox-Secret": SKLAD_OUTBOX_SECRET})
+            if r.status_code == 200:
+                return bool(r.json().get("registered"))
+    except Exception as e:
+        logger.warning(f"sklad_registered: {e}")
+    return None
+
+
 async def sklad_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/sklad — открыть мини-приложение «KENSUR Склад» (учёт комплектов на руках)."""
-    keyboard = [[InlineKeyboardButton("🏬 Открыть KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))]]
-    await update.message.reply_text(
-        "KENSUR Склад — комплекты и комплектующие, которые у вас на руках.\n"
-        "Отмечайте «Поставил», «Продал», принимайте выдачи одной кнопкой.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await send_sklad_instruction(update, context)
 
 
 async def sklad_outbox_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2400,7 +2460,7 @@ def register_handlers(app):
 
     app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
 
-    menu_buttons = ["📸 Новая установка", "📋 Мои отчёты", "📊 Статистика", "📊 Результат мастеров", "✏️ Изменить СБП-реквизиты"]
+    menu_buttons = ["📸 Новая установка", "📋 Мои отчёты", "📊 Статистика", "📊 Результат мастеров", "✏️ Изменить СБП-реквизиты", "📖 Инструкция по складу"]
     app.add_handler(MessageHandler(filters.Text(menu_buttons) & ~filters.COMMAND, menu_handler))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_amount_handler))
