@@ -699,7 +699,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if master_exists(user_id):
             await show_main_menu(update, context)
             # Кто ещё не зарегистрирован в KENSUR Склад — видит инструкцию сразу
-            if await sklad_registered(user_id) is False:
+            # (один раз — дальше она есть во вкладке «Инструкции» приложения и по кнопке в меню)
+            if not context.user_data.get("sklad_instr_sent") and await sklad_registered(user_id) is False:
                 await send_sklad_instruction(update, context)
             return ConversationHandler.END
         await update.message.reply_text(
@@ -2273,22 +2274,25 @@ SKLAD_INSTRUCTION = [
     "• Продали клиенту свой комплект и поставили: «Счёт клиенту по СБП» или «Продал». Комплект списывается сам, «Поставил» нажимать не нужно. Работу клиент оплачивает вам напрямую, отчёт в боте не нужен.\n"
     "Расчёты по заявкам позже переедут в Склад — предупредим отдельно.",
 
-    "6️⃣ Реже («Ещё»)\n"
+    "6️⃣ Вкладка «Инструкции»\n"
+    "Внизу приложения есть вкладка «📖 Инструкции». В ней: QR-коды и ссылки на приложение TTLock (покажите экран клиенту — он сканирует камерой и ставит приложение), инструкции по установке замка, шаблон врезки, руководства по TTLock и Алисе, схема обработки заявок и эта инструкция. У каждого документа две кнопки: «Открыть» (в браузере телефона) и «В Telegram» (файл придёт сюда, в чат, и откроется без интернета).\n"
+    "\n"
+    "7️⃣ Реже («Ещё»)\n"
     "• Вернул на склад — спишется после подтверждения склада.\n"
     "• Передал коллеге — другому мастеру вашего города, он подтвердит у себя.\n"
     "• Утеря или брак — списать с объяснением.\n"
     "• История — все движения по вашему складу.\n"
     "\n"
-    "7️⃣ Сроки\n"
+    "8️⃣ Сроки\n"
     "У цилиндровых механизмов срок реализации 90 дней, он показан рядом с позицией; за две недели придёт напоминание. Умные замки хранятся без срока.\n"
     "\n"
-    "8️⃣ Если что-то не так\n"
+    "9️⃣ Если что-то не так\n"
     "• Не открывается — закройте и откройте кнопку ещё раз, проверьте интернет.\n"
     "• Нет нужного комплекта при «Поставил» — сначала оформите «Получил товар».\n"
     "• Остаток в приложении не совпадает с тем, что лежит у вас — напишите Кириллу, он поправит.\n"
     "• Ошиблись в отчёте — напишите Кириллу, он поправит.\n"
     "\n"
-    "Инструкцию всегда можно открыть кнопкой «📖 Инструкция по складу» в меню.",
+    "Инструкцию всегда можно открыть кнопкой «📖 Инструкция по складу» в меню или во вкладке «📖 Инструкции» в самом приложении.",
 ]
 
 
@@ -2300,6 +2304,7 @@ async def send_sklad_instruction(update: Update, context: ContextTypes.DEFAULT_T
             part,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏬 Открыть KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))]]) if last else None,
         )
+    context.user_data["sklad_instr_sent"] = True
 
 
 async def sklad_registered(tg_id: int) -> bool | None:
@@ -2317,8 +2322,14 @@ async def sklad_registered(tg_id: int) -> bool | None:
 
 
 async def sklad_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/sklad — открыть мини-приложение «KENSUR Склад» (учёт комплектов на руках)."""
-    await send_sklad_instruction(update, context)
+    """/sklad — открыть мини-приложение «KENSUR Склад» (учёт комплектов на руках).
+    Полную инструкцию не шлём каждый раз: она приходит один раз при регистрации,
+    дальше живёт во вкладке «Инструкции» приложения и по кнопке «📖 Инструкция по складу»."""
+    await update.effective_message.reply_text(
+        "🏬 KENSUR Склад — учёт комплектов на руках: поставил, продал, получил, вернул.\n"
+        "Инструкции по замку, TTLock и самому Складу — во вкладке «📖 Инструкции» внутри приложения.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏬 Открыть KENSUR Склад", web_app=WebAppInfo(url=SKLAD_URL))]]),
+    )
 
 
 async def sklad_outbox_job(context: ContextTypes.DEFAULT_TYPE) -> None:
